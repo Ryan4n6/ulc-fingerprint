@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import re
 import sys
 from dataclasses import dataclass, field
@@ -75,6 +76,124 @@ class Result:
     confidence: str                      # high | medium | low
     evidence: list[str] = field(default_factory=list)
     caveats: list[str] = field(default_factory=list)
+
+
+# The Giantec/USCUID challenge is a 16-bit LFSR seeded by wakeup timing, so RndB
+# repeats fast. The paper observes a >50% duplicate chance within 12 nonces and
+# 99.99% within 39, which inverts (birthday bound) to an effective pool of only
+# ~2^6.5 values, not the LFSR's full 2^16. A genuine NXP TRNG draws RndB from
+# 2^64, where a single duplicate across any realistic batch is impossible.
+NONCE_OBSERVED_POOL = 95                  # ~2^6.6, the paper's deployed-card figure
+NONCE_GENUINE_BITS = 64
+# No collision across this many draws effectively rules out the LFSR: P(no dup)
+# for a ~2^6.5 pool at 39 draws is under 0.01%.
+NONCE_CLEAR_THRESHOLD = 39
+
+
+@dataclass
+class NonceReport:
+    total: int
+    distinct: int
+    duplicates: int
+    first_collision_at: int | None        # 1-based draw index of first repeat
+    est_pool: float | None                 # birthday-inverted effective pool
+    p_genuine_would_dup: float             # P(a 2^64 TRNG collides in this batch)
+    verdict: Verdict
+    confidence: str
+    notes: list[str] = field(default_factory=list)
+
+
+def _normalize_nonce(s: str) -> str:
+    """Reduce a captured RndB response to comparable hex: drop the CRC bracket,
+    keep hex only, uppercase, strip a leading AF status byte so AF-prefixed and
+    bare captures compare equal within a batch."""
+    s = re.sub(r"\[[^\]]*\]", "", s)      # drop trailing CRC like [6355]
+    s = re.sub(r"[^0-9A-Fa-f]", "", s)
+    s = s.upper()
+    if s.startswith("AF") and len(s) > 2:
+        s = s[2:]
+    return s
+
+
+def _estimate_pool(distinct: int, n: int) -> float | None:
+    """Invert E[distinct] = N(1-(1-1/N)^n) for N, given observed distinct in n
+    draws. Monotonic in N, so bisect."""
+    if distinct >= n or distinct < 1:
+        return None
+    lo, hi = float(distinct), 1e9
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        exp = mid * (1 - (1 - 1 / mid) ** n)
+        if exp < distinct:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+def analyze_nonces(samples: list[str]) -> NonceReport:
+    """Collision analysis over a batch of captured RndB responses."""
+    norm = [v for v in (_normalize_nonce(s) for s in samples) if v]
+    n = len(norm)
+    distinct = len(set(norm))
+    dups = n - distinct
+
+    seen: set[str] = set()
+    first: int | None = None
+    for i, v in enumerate(norm, 1):
+        if v in seen and first is None:
+            first = i
+        seen.add(v)
+
+    # P(a genuine 64-bit TRNG produces >=1 collision in n draws).
+    p_trng = 1 - math.exp(-n * (n - 1) / (2 * 2 ** NONCE_GENUINE_BITS)) if n > 1 else 0.0
+    pool = _estimate_pool(distinct, n) if dups > 0 else None
+    notes: list[str] = []
+
+    if n == 0:
+        return NonceReport(0, 0, 0, None, None, 0.0, Verdict.INCONCLUSIVE, "low",
+                           ["no parseable nonces in input"])
+
+    if dups > 0:
+        notes.append(f"{dups} duplicate RndB in {n} draws, first repeat at draw {first}")
+        if pool is not None:
+            notes.append(f"effective pool ~{pool:.0f} (~2^{math.log2(pool):.1f}); "
+                         f"genuine TRNG is 2^{NONCE_GENUINE_BITS}")
+        notes.append(f"a genuine TRNG would collide here with p={p_trng:.2e}, so a "
+                     f"duplicate is proof of a weak PRNG (LFSR counterfeit)")
+        return NonceReport(n, distinct, dups, first, pool, p_trng,
+                           Verdict.SUSPECT, "high", notes)
+
+    # no duplicates
+    if n >= NONCE_CLEAR_THRESHOLD:
+        notes.append(f"no collision in {n} draws; a ~2^6.5 LFSR pool would have "
+                     f"collided with >99.99% probability by now")
+        notes.append("consistent with a genuine NXP TRNG")
+        return NonceReport(n, distinct, dups, first, pool, p_trng,
+                           Verdict.GENUINE, "medium", notes)
+
+    notes.append(f"no collision yet, but only {n} draws; capture at least "
+                 f"{NONCE_CLEAR_THRESHOLD} to rule out the LFSR pool")
+    return NonceReport(n, distinct, dups, first, pool, p_trng,
+                       Verdict.INCONCLUSIVE, "low", notes)
+
+
+def _extract_nonces(text: str) -> list[str]:
+    """Pull RndB samples from either a nonce list (one per line) or a fingerprint
+    capture (the `Cmd 1a00:` response lines)."""
+    out: list[str] = []
+    for line in text.splitlines():
+        m = re.search(r"1a00:\s*([0-9A-Fa-f]+(?:\[[0-9A-Fa-f]+\])?)", line)
+        if m:
+            out.append(m.group(1))
+            continue
+        t = line.strip()
+        if not t:
+            continue
+        hexonly = re.sub(r"[^0-9A-Fa-f]", "", re.sub(r"\[[^\]]*\]", "", t))
+        if len(hexonly) >= 8 and re.fullmatch(r"[0-9A-Fa-f\[\] ]+", t):
+            out.append(t)
+    return out
 
 
 def _expand_ranges(spec: str) -> set[int]:
@@ -171,9 +290,12 @@ def parse_fingerprint(text: str) -> Fingerprint:
         if m:
             fp.rnd_b_samples.append(m.group(1).upper())
 
-    # repeated RndB across samples is itself a weak-PRNG signal
-    if len(fp.rnd_b_samples) >= 2 and len(set(fp.rnd_b_samples)) < len(fp.rnd_b_samples):
-        fp.prng_weak = True
+    # repeated RndB across samples is itself a weak-PRNG signal; run the active
+    # collision analysis rather than a bare set-length check so a single dup in
+    # the capture is scored the same way as the --nonces mode.
+    if len(fp.rnd_b_samples) >= 2:
+        if analyze_nonces(fp.rnd_b_samples).duplicates > 0:
+            fp.prng_weak = True
 
     log.debug("parsed uid=%s fdt_1a00=%s fdt_af_bad=%s cmd00_ack=%s prng_weak=%s",
               fp.uid, fp.fdt_1a00, fp.fdt_af_badkey,
@@ -290,10 +412,42 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-v", "--verbose", action="count", default=0,
                     help="-v for INFO, -vv for DEBUG (to stderr)")
     ap.add_argument("--json", action="store_true", help="emit JSON")
+    ap.add_argument("--nonces", action="store_true",
+                    help="treat the input as a batch of captured RndB responses "
+                         "(one per line, or a capture's Cmd 1a00 lines) and run "
+                         "only the PRNG collision analysis")
     args = ap.parse_args(argv)
     _setup_logging(args.verbose)
 
     text = sys.stdin.read() if args.capture == "-" else open(args.capture).read()
+
+    if args.nonces:
+        rep = analyze_nonces(_extract_nonces(text))
+        if args.json:
+            import json
+            print(json.dumps({
+                "mode": "nonces",
+                "total": rep.total, "distinct": rep.distinct,
+                "duplicates": rep.duplicates,
+                "first_collision_at": rep.first_collision_at,
+                "effective_pool": rep.est_pool,
+                "p_genuine_would_dup": rep.p_genuine_would_dup,
+                "verdict": rep.verdict.name,
+                "verdict_text": rep.verdict.value,
+                "confidence": rep.confidence,
+                "notes": rep.notes,
+            }, indent=2))
+        else:
+            print(f"Nonces:     {rep.total} captured, {rep.distinct} distinct, "
+                  f"{rep.duplicates} duplicate")
+            if rep.first_collision_at:
+                print(f"First repeat at draw {rep.first_collision_at}")
+            print(f"Verdict:    {rep.verdict.value}")
+            print(f"Confidence: {rep.confidence}")
+            for note in rep.notes:
+                print(f"  - {note}")
+        return 0
+
     fp = parse_fingerprint(text)
     res = classify(fp)
 

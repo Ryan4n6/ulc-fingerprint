@@ -9,7 +9,9 @@ import sys
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from ulc_classify import Verdict, classify, parse_fingerprint  # noqa: E402
+from ulc_classify import (  # noqa: E402
+    Verdict, analyze_nonces, classify, parse_fingerprint,
+)
 
 FIX = pathlib.Path(__file__).resolve().parent.parent / "fixtures"
 
@@ -73,3 +75,46 @@ def test_range_expansion():
     from ulc_classify import _expand_ranges
     got = _expand_ranges("00-02,10,1b-1c")
     assert got == {0x00, 0x01, 0x02, 0x10, 0x1b, 0x1c}
+
+
+# --- nonce collision analysis -----------------------------------------------
+
+def test_nonces_lfsr_batch_flagged():
+    from ulc_classify import _extract_nonces
+    text = (FIX / "nonces_ulcg.txt").read_text()
+    rep = analyze_nonces(_extract_nonces(text))
+    assert rep.duplicates > 0
+    assert rep.verdict == Verdict.SUSPECT and rep.confidence == "high"
+    # effective pool should land near the paper's ~2^6.5, not the 2^16 state space
+    assert rep.est_pool is not None and 16 < rep.est_pool < 512
+
+
+def test_nonces_genuine_batch_cleared():
+    from ulc_classify import _extract_nonces
+    text = (FIX / "nonces_genuine.txt").read_text()
+    rep = analyze_nonces(_extract_nonces(text))
+    assert rep.duplicates == 0
+    assert rep.verdict == Verdict.GENUINE
+
+
+def test_single_duplicate_is_conclusive():
+    # one repeat is enough: a 2^64 TRNG colliding is ~0
+    rep = analyze_nonces(["AABBCCDDEEFF0011", "1122334455667788", "AABBCCDDEEFF0011"])
+    assert rep.duplicates == 1
+    assert rep.first_collision_at == 3
+    assert rep.p_genuine_would_dup < 1e-30
+    assert rep.verdict == Verdict.SUSPECT
+
+
+def test_too_few_nonces_inconclusive():
+    rep = analyze_nonces(["AABBCCDDEEFF0011", "1122334455667788"])
+    assert rep.duplicates == 0
+    assert rep.verdict == Verdict.INCONCLUSIVE
+
+
+def test_nonce_normalization_strips_af_and_crc():
+    from ulc_classify import _normalize_nonce
+    assert _normalize_nonce("AF BC8FCFBE5821FFBC [6355]") == "BC8FCFBE5821FFBC"
+    # AF-prefixed and bare forms of the same RndB collide within a batch
+    rep = analyze_nonces(["AFBC8FCFBE5821FFBC[6355]", "BC8FCFBE5821FFBC"])
+    assert rep.duplicates == 1
